@@ -1,0 +1,310 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ------------------------------------------------------------------
+    // Roles
+    //   student : approved on signup
+    //   teacher : pending until an admin approves
+    //   admin   : cannot be created by the app. Set once, by hand, in the
+    //             Firebase console (see README).
+    // Anything not matched below is denied by default.
+    // ------------------------------------------------------------------
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function hasProfile() {
+      return signedIn() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    function caller() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function isAdmin() {
+      return hasProfile() && caller().role == 'admin';
+    }
+
+    // Admins, plus any student / teacher whose account has been approved.
+    function isCleared() {
+      return hasProfile() &&
+        (caller().role == 'admin' || caller().approvalStatus == 'approved');
+    }
+
+    function isApprovedStudent() {
+      return hasProfile() &&
+        caller().role == 'student' && caller().approvalStatus == 'approved';
+    }
+
+    function isApprovedTeacher() {
+      return hasProfile() &&
+        caller().role == 'teacher' && caller().approvalStatus == 'approved';
+    }
+
+    function courseExists(courseId) {
+      return exists(/databases/$(database)/documents/courses/$(courseId));
+    }
+
+    function courseData(courseId) {
+      return get(/databases/$(database)/documents/courses/$(courseId)).data;
+    }
+
+    function ownsCourse(courseId) {
+      return isApprovedTeacher() &&
+        courseExists(courseId) &&
+        courseData(courseId).teacher.email == request.auth.token.email;
+    }
+
+    function canManageCourse(courseId) {
+      return isAdmin() || ownsCourse(courseId);
+    }
+
+    function checkInOpen(courseId) {
+      return courseExists(courseId) &&
+        courseData(courseId).get('attendanceOpen', true) != false;
+    }
+
+    // ------------------------------------------------------------------
+    // Users
+    // ------------------------------------------------------------------
+    match /users/{userId} {
+      // Everyone can always read their own profile (needed to learn they are pending).
+      allow get: if signedIn() && (request.auth.uid == userId || isCleared());
+      allow list: if isCleared();
+
+      // Sign-up: you can only create your own profile, never as admin.
+      // Students start approved; teachers start pending.
+      allow create: if signedIn() &&
+        request.auth.uid == userId &&
+        request.resource.data.id == userId &&
+        request.resource.data.email == request.auth.token.email &&
+        (
+          (request.resource.data.role == 'student' &&
+            request.resource.data.approvalStatus == 'approved') ||
+          (request.resource.data.role == 'teacher' &&
+            request.resource.data.approvalStatus == 'pending')
+        );
+
+      allow update: if signedIn() && (
+        // Your own profile: role, approval status, email and id are locked.
+        (
+          request.auth.uid == userId &&
+          !request.resource.data.diff(resource.data).affectedKeys()
+            .hasAny(['role', 'approvalStatus', 'email', 'id', 'createdAt'])
+        ) ||
+        // Admin: may only change role / approval of someone else, and can
+        // never create or touch another admin.
+        (
+          isAdmin() &&
+          request.auth.uid != userId &&
+          resource.data.role != 'admin' &&
+          request.resource.data.role != 'admin' &&
+          request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['role', 'approvalStatus'])
+        )
+      );
+
+      // Removing a profile. (This does not delete the Firebase Auth login;
+      // see README for the full-removal step.)
+      allow delete: if isAdmin() &&
+        request.auth.uid != userId &&
+        resource.data.role != 'admin';
+    }
+
+    // ------------------------------------------------------------------
+    // Courses
+    // ------------------------------------------------------------------
+    match /courses/{courseId} {
+      allow read: if isCleared();
+
+      allow create: if isAdmin() ||
+        (isApprovedTeacher() &&
+          request.resource.data.teacher.email == request.auth.token.email);
+
+      allow update: if isAdmin() ||
+        (isApprovedTeacher() &&
+          resource.data.teacher.email == request.auth.token.email &&
+          request.resource.data.teacher.email == resource.data.teacher.email);
+
+      allow delete: if isAdmin() ||
+        (isApprovedTeacher() &&
+          resource.data.teacher.email == request.auth.token.email);
+    }
+
+    // ------------------------------------------------------------------
+    // Topics and assignments (shared class content, teacher-managed)
+    // Note: on delete there is no request.resource, so use resource.data.
+    // ------------------------------------------------------------------
+    match /topics/{topicId} {
+      allow read: if isCleared();
+      allow create: if canManageCourse(request.resource.data.courseId);
+      allow update: if canManageCourse(resource.data.courseId) &&
+        request.resource.data.courseId == resource.data.courseId;
+      allow delete: if canManageCourse(resource.data.courseId);
+    }
+
+    match /assignments/{assignmentId} {
+      allow read: if isCleared();
+      allow create: if canManageCourse(request.resource.data.courseId);
+      allow update: if canManageCourse(resource.data.courseId) &&
+        request.resource.data.courseId == resource.data.courseId;
+      allow delete: if canManageCourse(resource.data.courseId);
+    }
+
+    // ------------------------------------------------------------------
+    // Submissions (private per student)
+    // Students read only their own. The class teacher / admin read the course.
+    // Students can never set a grade; teachers can only change grading fields.
+    // ------------------------------------------------------------------
+    match /submissions/{submissionId} {
+      allow read: if isCleared() && (
+        resource.data.studentEmail == request.auth.token.email ||
+        isAdmin() ||
+        ownsCourse(resource.data.courseId)
+      );
+
+      allow create: if isApprovedStudent() &&
+        submissionId == 'sub-' + request.resource.data.assignmentId + '-' + request.auth.uid &&
+        request.resource.data.studentId == request.auth.uid &&
+        request.resource.data.studentEmail == request.auth.token.email &&
+        request.resource.data.status == 'turned_in' &&
+        !request.resource.data.keys()
+          .hasAny(['pointsEarned', 'feedback', 'gradedAt', 'gradedBy']) &&
+        exists(/databases/$(database)/documents/assignments/$(request.resource.data.assignmentId)) &&
+        get(/databases/$(database)/documents/assignments/$(request.resource.data.assignmentId)).data.courseId
+          == request.resource.data.courseId;
+
+      allow update: if (
+        // Student editing their own work, only until it has been graded.
+        (
+          isApprovedStudent() &&
+          resource.data.studentEmail == request.auth.token.email &&
+          resource.data.status == 'turned_in' &&
+          request.resource.data.status == 'turned_in' &&
+          request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['submittedAt', 'fileTitle', 'fileUrl', 'submissionText'])
+        ) ||
+        // Teacher / admin grading.
+        (
+          canManageCourse(resource.data.courseId) &&
+          request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['pointsEarned', 'feedback', 'status', 'gradedAt', 'gradedBy']) &&
+          request.resource.data.pointsEarned is number &&
+          request.resource.data.pointsEarned >= 0 &&
+          request.resource.data.pointsEarned <= resource.data.maxPoints
+        )
+      );
+
+      // A student can withdraw their work until it is graded.
+      allow delete: if (
+        isApprovedStudent() &&
+        resource.data.studentEmail == request.auth.token.email &&
+        resource.data.status == 'turned_in'
+      ) || canManageCourse(resource.data.courseId);
+    }
+
+    // ------------------------------------------------------------------
+    // Attendance (private per student)
+    // A student can create / change only their own self check-in, only while
+    // check-in is open, and never once a teacher has verified the record.
+    // ------------------------------------------------------------------
+    match /attendance/{attendanceId} {
+      allow read: if isCleared() && (
+        resource.data.studentEmail == request.auth.token.email ||
+        isAdmin() ||
+        ownsCourse(resource.data.courseId)
+      );
+
+      allow create: if canManageCourse(request.resource.data.courseId) || (
+        isApprovedStudent() &&
+        attendanceId == 'att-' + request.resource.data.courseId + '-' + request.auth.uid + '-' + request.resource.data.date &&
+        request.resource.data.studentId == request.auth.uid &&
+        request.resource.data.studentEmail == request.auth.token.email &&
+        request.resource.data.submittedBy == 'student' &&
+        request.resource.data.verifiedByTeacher == false &&
+        checkInOpen(request.resource.data.courseId)
+      );
+
+      allow update: if canManageCourse(resource.data.courseId) || (
+        isApprovedStudent() &&
+        resource.data.studentEmail == request.auth.token.email &&
+        resource.data.submittedBy == 'student' &&
+        resource.data.verifiedByTeacher == false &&
+        request.resource.data.submittedBy == 'student' &&
+        request.resource.data.verifiedByTeacher == false &&
+        !request.resource.data.diff(resource.data).affectedKeys()
+          .hasAny(['courseId', 'studentId', 'studentEmail', 'date']) &&
+        checkInOpen(resource.data.courseId)
+      );
+
+      allow delete: if canManageCourse(resource.data.courseId);
+    }
+
+    // ------------------------------------------------------------------
+    // Class stream
+    // ------------------------------------------------------------------
+    match /announcements/{announcementId} {
+      allow read: if isCleared();
+
+      // Posts must be attributed to the real author and their real role.
+      // Only the class teacher / admin can post as teacher / admin.
+      allow create: if isCleared() &&
+        request.resource.data.authorId == request.auth.uid &&
+        request.resource.data.author.role == caller().role &&
+        (caller().role == 'student' || canManageCourse(request.resource.data.courseId)) &&
+        request.resource.data.comments.size() == 0;
+
+      allow update: if isCleared() && (
+        // Class teacher / admin can edit the post.
+        (
+          canManageCourse(resource.data.courseId) &&
+          request.resource.data.courseId == resource.data.courseId
+        ) ||
+        // Anyone cleared can comment: only the comments list may change,
+        // and it may only grow.
+        (
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['comments']) &&
+          request.resource.data.comments.size() >= resource.data.comments.size()
+        )
+      );
+
+      allow delete: if isCleared() && (
+        resource.data.authorId == request.auth.uid ||
+        canManageCourse(resource.data.courseId)
+      );
+    }
+
+    // School-wide broadcasts: admin only.
+    match /schoolAnnouncements/{announcementId} {
+      allow read: if isCleared();
+      allow create, update, delete: if isAdmin();
+    }
+
+    // ------------------------------------------------------------------
+    // Roster
+    // A student can add or remove only their own membership. The class
+    // teacher / admin manage everyone else.
+    // ------------------------------------------------------------------
+    match /classmates/{classmateId} {
+      allow read: if isCleared();
+
+      allow create: if canManageCourse(request.resource.data.courseId) || (
+        isApprovedStudent() &&
+        classmateId == 'cm-' + request.resource.data.courseId + '-' + request.auth.uid &&
+        request.resource.data.role == 'student' &&
+        request.resource.data.email == request.auth.token.email &&
+        courseExists(request.resource.data.courseId)
+      );
+
+      allow update: if canManageCourse(resource.data.courseId);
+
+      allow delete: if canManageCourse(resource.data.courseId) || (
+        resource.data.role == 'student' &&
+        resource.data.email == request.auth.token.email
+      );
+    }
+  }
+}
